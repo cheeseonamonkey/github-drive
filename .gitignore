@@ -4,3 +4,5 @@ dist/
 !.env.example
 .DS_Store
 *.log
+auth-worker/wrangler.jsonc
+.wrangler/

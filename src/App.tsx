@@ -1,67 +1,117 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowDownToLine, ArrowLeft, ChevronRight, File, FileText, Folder, FolderPlus,
-  GitBranch, Image as ImageIcon, LogOut, Pencil, RefreshCw, Search, ShieldCheck,
-  Trash2, Upload, X,
+  ArrowDownToLine, ArrowLeft, Check, ChevronDown, ChevronRight, Code2, Copy, ExternalLink,
+  File, FileArchive, FileText, Folder, FolderPlus, GitBranch, Grid2X2, HardDrive,
+  Image as ImageIcon, LayoutList, LockKeyhole, LogOut, Pencil, RefreshCw,
+  Search, ShieldCheck, Trash2, Upload, X,
 } from 'lucide-react';
 import { encodePath, Entry, GitHubDrive, MAX_UPLOAD_BYTES, RepoDetails } from './github';
+import { beginGitHubLogin, completeGitHubLogin, oauthEnabled } from './auth';
+import {
+  category, entriesBy, extension, FileCategory, FileSort, PREVIEW_IMAGES, PREVIEW_TEXT,
+  readableSize, typeLabel, validName,
+} from './file';
 
 type Connection = { api: GitHubDrive; repo: RepoDetails };
 type Preview = { kind: 'loading' | 'text' | 'image' | 'other' | 'error'; value?: string };
+type NameDialog = { type: 'folder' | 'rename'; item?: Entry };
+type View = 'list' | 'grid';
 
-const button = 'inline-flex min-h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-medium transition hover:opacity-85';
-const secondary = button + ' border border-line bg-white text-ink';
-const primary = button + ' bg-accent text-white';
-const textFile = /\.(?:txt|md|markdown|csv|json|jsonl|yml|yaml|xml|toml|ini|log|js|jsx|ts|tsx|css|scss|html|py|rs|go|sh|java|kt|sql|svg)$/i;
-const imageFile = /\.(?:png|jpg|jpeg|webp|gif|bmp|avif)$/i;
+const categoryFilters: { value: FileCategory; label: string }[] = [
+  { value: 'all', label: 'All files' },
+  { value: 'documents', label: 'Documents' },
+  { value: 'images', label: 'Images' },
+  { value: 'code', label: 'Code' },
+];
 
-function readableSize(bytes: number): string {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 ** 2) return (bytes / 1024).toFixed(1) + ' KiB';
-  return (bytes / 1024 ** 2).toFixed(1) + ' MiB';
+function ItemIcon({ item, large = false }: { item: Entry; large?: boolean }) {
+  const size = large ? 27 : 21;
+  const kind = category(item);
+  const icon = kind === 'folder' ? <Folder size={size} /> :
+    kind === 'images' ? <ImageIcon size={size} /> :
+    kind === 'documents' ? <FileText size={size} /> :
+    kind === 'code' ? <Code2 size={size} /> :
+    ['zip', 'tar', 'gz', '7z', 'rar'].includes(extension(item.name)) ? <FileArchive size={size} /> :
+    <File size={size} />;
+  return <span className={'flex shrink-0 items-center justify-center rounded-xl ' +
+    (large ? 'size-12' : 'size-10') + (kind === 'folder' ? ' bg-[#f0ebf9] text-accent' : ' bg-[#f6f5f8] text-[#8d8799]')}>
+    {icon}
+  </span>;
 }
 
-function validName(name: string): boolean {
-  return !!name && name !== '.' && name !== '..' && !/[\\/\x00-\x1f]/.test(name);
+function formatError(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason);
 }
 
-function ItemIcon({ item }: { item: Entry }) {
-  if (item.type === 'dir') return <Folder className="shrink-0 text-accent" size={22} />;
-  if (imageFile.test(item.name)) return <ImageIcon className="shrink-0 text-muted" size={22} />;
-  if (textFile.test(item.name)) return <FileText className="shrink-0 text-muted" size={22} />;
-  return <File className="shrink-0 text-muted" size={22} />;
+function NameEditor({ title, value, onCancel, onSave }: {
+  title: string;
+  value: string;
+  onCancel: () => void;
+  onSave: (name: string) => void;
+}) {
+  const [name, setName] = useState(value);
+  return (
+    <div className="fixed inset-0 z-60 flex items-center justify-center bg-[#201b2b]/35 p-4"
+      onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
+      <form className="surface w-full max-w-sm p-5 shadow-xl" onSubmit={(event) => {
+        event.preventDefault();
+        onSave(name.trim());
+      }}>
+        <h3 className="font-medium">{title}</h3>
+        <label className="mt-4 block text-xs text-muted" htmlFor="new-name">Name</label>
+        <input id="new-name" className="field mt-1.5" autoFocus value={name}
+          onChange={(event) => setName(event.target.value)} />
+        <div className="mt-5 flex justify-end gap-2">
+          <button className="action action-outline" type="button" onClick={onCancel}>Cancel</button>
+          <button className="action action-primary" type="submit">Save</button>
+        </div>
+      </form>
+    </div>
+  );
 }
 
 export default function App() {
   const [repository, setRepository] = useState('');
   const [token, setToken] = useState('');
+  const [oauthToken, setOauthToken] = useState('');
   const [connection, setConnection] = useState<Connection | null>(null);
   const [path, setPath] = useState('');
   const [items, setItems] = useState<Entry[]>([]);
   const [filter, setFilter] = useState('');
+  const [typeFilter, setTypeFilter] = useState<FileCategory>('all');
+  const [sort, setSort] = useState<FileSort>('name');
+  const [view, setView] = useState<View>('list');
   const [version, setVersion] = useState(0);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [selected, setSelected] = useState<Entry | null>(null);
   const [preview, setPreview] = useState<Preview>({ kind: 'other' });
+  const [nameDialog, setNameDialog] = useState<NameDialog | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [copied, setCopied] = useState(false);
   const uploadRef = useRef<HTMLInputElement>(null);
+  const dragDepth = useRef(0);
 
-  function refresh() {
-    setVersion((value) => value + 1);
-  }
+  const shown = useMemo(() => entriesBy(items.filter((item) =>
+    item.name.toLowerCase().includes(filter.trim().toLowerCase()) &&
+    (typeFilter === 'all' || category(item) === 'folder' || category(item) === typeFilter)
+  ), sort), [items, filter, typeFilter, sort]);
+
+  const fileCount = items.filter((item) => item.type !== 'dir').length;
+  const folderCount = items.filter((item) => item.type === 'dir').length;
+  const folderBytes = items.reduce((sum, item) => sum + (item.type === 'dir' ? 0 : item.size), 0);
+  const segments = path ? path.split('/') : [];
+
+  function refresh() { setVersion((value) => value + 1); }
 
   async function perform(label: string, job: () => Promise<void>) {
     if (busy) return;
     setBusy(label);
     setError('');
-    try {
-      await job();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setBusy('');
-    }
+    try { await job(); }
+    catch (reason) { setError(formatError(reason)); }
+    finally { setBusy(''); }
   }
 
   useEffect(() => {
@@ -69,14 +119,10 @@ export default function App() {
     let active = true;
     setLoading(true);
     setError('');
+    setItems([]);
     connection.api.list(path, connection.repo.default_branch)
       .then((entries) => { if (active) setItems(entries); })
-      .catch((reason: unknown) => {
-        if (active) {
-          setItems([]);
-          setError(reason instanceof Error ? reason.message : String(reason));
-        }
-      })
+      .catch((reason: unknown) => { if (active) setError(formatError(reason)); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [connection, path, version]);
@@ -84,9 +130,9 @@ export default function App() {
   useEffect(() => {
     if (!selected || !connection) return;
     setPreview({ kind: 'loading' });
-
-    const isImage = imageFile.test(selected.name);
-    const isText = textFile.test(selected.name) && !/\.svg$/i.test(selected.name);
+    const ext = extension(selected.name);
+    const isImage = PREVIEW_IMAGES.has(ext);
+    const isText = PREVIEW_TEXT.has(ext);
     if (selected.size > MAX_UPLOAD_BYTES || (!isImage && !isText)) {
       setPreview({ kind: 'other' });
       return;
@@ -105,18 +151,33 @@ export default function App() {
           if (active) setPreview({ kind: 'text', value: content.slice(0, 250_000) });
         }
       })
-      .catch((reason: unknown) => {
-        if (active) setPreview({ kind: 'error', value: String(reason) });
-      });
+      .catch((reason: unknown) => { if (active) setPreview({ kind: 'error', value: formatError(reason) }); });
     return () => {
       active = false;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [connection, selected]);
 
-  async function connect() {
-    await perform('Connecting', async () => {
-      const api = new GitHubDrive(token.trim(), repository.trim());
+  useEffect(() => {
+    if (!selected && !nameDialog) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setNameDialog(null);
+        setSelected(null);
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = previous;
+    };
+  }, [selected, nameDialog]);
+
+  async function connectUsing(secret: string, target: string) {
+    await perform('Connecting…', async () => {
+      const api = new GitHubDrive(secret.trim(), target.trim());
       const repo = await api.details();
       await api.list('', repo.default_branch);
       setConnection({ api, repo });
@@ -125,90 +186,127 @@ export default function App() {
     });
   }
 
+  async function connect() {
+    await connectUsing(oauthToken || token, repository);
+  }
+
+  useEffect(() => {
+    let active = true;
+    void completeGitHubLogin()
+      .then((result) => {
+        if (!active || !result) return;
+        setOauthToken(result.token);
+        setRepository(result.repository);
+        if (result.repository) void connectUsing(result.token, result.repository);
+      })
+      .catch((reason: unknown) => { if (active) setError(formatError(reason)); });
+    return () => { active = false; };
+  }, []);
+
+  function navigate(next: string) {
+    setFilter('');
+    setTypeFilter('all');
+    setSelected(null);
+    setPath(next);
+  }
+
   function open(item: Entry) {
-    if (item.type === 'dir') {
-      setFilter('');
-      setPath(item.path);
-    } else if (item.type === 'file') {
-      setSelected(item);
-    }
+    if (item.type === 'dir') navigate(item.path);
+    else if (item.type === 'file') { setCopied(false); setSelected(item); }
+    else setError('Git submodules and symlinks cannot be opened in this file manager.');
   }
 
   function upload(files: File[]) {
     if (!connection || files.length === 0) return;
-    void perform('Uploading', async () => {
+    void perform('Uploading…', async () => {
       try {
         for (const file of files) {
           if (!validName(file.name)) throw new Error('Invalid filename: ' + file.name);
-          if (file.size > MAX_UPLOAD_BYTES) throw new Error(file.name + ' is over the 10 MiB limit.');
+          if (file.size > MAX_UPLOAD_BYTES) throw new Error(file.name + ' exceeds the 10 MiB limit.');
           const existing = items.find((item) => item.name === file.name);
           if (existing?.type === 'dir') throw new Error('A folder already uses the name ' + file.name);
           if (existing && !window.confirm('Replace ' + file.name + '?')) continue;
-          const target = [path, file.name].filter(Boolean).join('/');
-          await connection.api.write(target, new Uint8Array(await file.arrayBuffer()), existing?.sha);
+          await connection.api.write([path, file.name].filter(Boolean).join('/'),
+            new Uint8Array(await file.arrayBuffer()), existing?.sha);
         }
-      } finally {
-        refresh();
-      }
+      } finally { refresh(); }
     });
   }
 
-  function addFolder() {
-    if (!connection) return;
-    const name = window.prompt('Folder name')?.trim();
-    if (name == null) return;
-    if (!validName(name)) { setError('Choose a valid folder name.'); return; }
+  function onDragEnter(event: React.DragEvent) {
+    if (!connection || busy || !event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    dragDepth.current += 1;
+    setDragging(true);
+  }
+
+  function onDragLeave(event: React.DragEvent) {
+    event.preventDefault();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (!dragDepth.current) setDragging(false);
+  }
+
+  function onDrop(event: React.DragEvent) {
+    if (!connection || !dragging) return;
+    event.preventDefault();
+    dragDepth.current = 0;
+    setDragging(false);
+    if (busy) return;
+    const files = Array.from(event.dataTransfer.files);
+    upload(files);
+  }
+
+  function saveName(name: string) {
+    if (!connection || !nameDialog) return;
+    if (!validName(name)) { setError('Choose a valid name (no slashes or control characters).'); return; }
+    const target = nameDialog.item;
+    if (target?.name === name) { setNameDialog(null); return; }
     if (items.some((item) => item.name === name)) { setError('That name already exists.'); return; }
-    void perform('Creating folder', async () => {
-      const marker = [path, name, '.gitkeep'].filter(Boolean).join('/');
-      await connection.api.write(marker, new Uint8Array());
-      refresh();
-    });
-  }
-
-  function removeEmptyFolder() {
-    if (!connection || !path || !window.confirm('Remove this empty folder?')) return;
-    void perform('Deleting folder', async () => {
-      await connection.api.deleteEmptyFolder(path, connection.repo.default_branch);
-      setPath(path.split('/').slice(0, -1).join('/'));
-      refresh();
-    });
+    const kind = nameDialog.type;
+    setNameDialog(null);
+    if (kind === 'folder') {
+      void perform('Creating…', async () => {
+        await connection.api.write([path, name, '.gitkeep'].filter(Boolean).join('/'), new Uint8Array());
+        refresh();
+      });
+    } else if (target) {
+      if (target.size > MAX_UPLOAD_BYTES) { setError('Files over 10 MiB cannot be renamed.'); return; }
+      void perform('Renaming…', async () => {
+        const newPath = [path, name].filter(Boolean).join('/');
+        const blob = await connection.api.read(target.path, connection.repo.default_branch);
+        await connection.api.write(newPath, new Uint8Array(await blob.arrayBuffer()));
+        try { await connection.api.delete(target.path, target.sha); }
+        catch (reason) {
+          refresh();
+          throw new Error('New file created, but the original could not be deleted. Both may exist. ' + formatError(reason));
+        }
+        setSelected(null);
+        refresh();
+      });
+    }
   }
 
   function remove(item: Entry) {
-    if (!connection || !window.confirm('Delete ' + item.name + '? Git history will retain old versions.')) return;
-    void perform('Deleting', async () => {
+    if (!connection || !window.confirm('Delete ' + item.name + '? Git history will retain earlier versions.')) return;
+    void perform('Deleting…', async () => {
       await connection.api.delete(item.path, item.sha);
       setSelected(null);
       refresh();
     });
   }
 
-  function rename(item: Entry) {
-    if (!connection) return;
-    const newName = window.prompt('New filename', item.name)?.trim();
-    if (newName == null || newName === item.name) return;
-    if (!validName(newName)) { setError('Choose a valid filename.'); return; }
-    if (items.some((other) => other.name === newName)) { setError('That name already exists.'); return; }
-    if (item.size > MAX_UPLOAD_BYTES) { setError('Cannot rename files over 10 MiB.'); return; }
-    void perform('Renaming', async () => {
-      const newPath = [path, newName].filter(Boolean).join('/');
-      const blob = await connection.api.read(item.path, connection.repo.default_branch);
-      await connection.api.write(newPath, new Uint8Array(await blob.arrayBuffer()));
-      try {
-        await connection.api.delete(item.path, item.sha);
-      } catch (reason) {
-        refresh();
-        throw new Error('The new file was created, but removing the old one failed. Both may exist. ' + String(reason));
-      }
-      setSelected(null);
+  function removeEmptyFolder() {
+    if (!connection || !path || !window.confirm('Remove this empty folder?')) return;
+    void perform('Deleting folder…', async () => {
+      await connection.api.deleteEmptyFolder(path, connection.repo.default_branch);
+      navigate(segments.slice(0, -1).join('/'));
       refresh();
     });
   }
 
   function download(item: Entry) {
     if (!connection) return;
-    void perform('Downloading', async () => {
+    void perform('Downloading…', async () => {
       const blob = await connection.api.read(item.path, connection.repo.default_branch);
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
@@ -221,226 +319,345 @@ export default function App() {
     });
   }
 
-  useEffect(() => {
-    if (!selected) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setSelected(null);
-    };
-    document.addEventListener('keydown', onKeyDown);
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.removeEventListener('keydown', onKeyDown);
-      document.body.style.overflow = previousOverflow;
-    };
-  }, [selected]);
+  async function copyPath(item: Entry) {
+    try {
+      await navigator.clipboard.writeText(item.path);
+      setCopied(true);
+    } catch { setError('Unable to copy path. Check clipboard permissions.'); }
+  }
 
-  const segments = path ? path.split('/') : [];
-  const shown = items.filter((item) => item.name.toLowerCase().includes(filter.toLowerCase()));
+  function disconnect() {
+    setOauthToken('');
+    setToken('');
+    setConnection(null);
+    setItems([]);
+    setSelected(null);
+    setError('');
+    setPath('');
+  }
 
   return (
-    <div className="min-h-dvh bg-paper">
-      <header className="border-b border-line bg-white">
-        <div className="mx-auto flex min-h-17 max-w-5xl items-center justify-between gap-3 px-4 sm:px-6">
-          <div className="flex items-center gap-3">
-            <div className="rounded-xl bg-accent/10 p-2.5 text-accent"><Folder size={22} /></div>
-            <div>
-              <h1 className="font-semibold tracking-tight">RepoDrive</h1>
-              <p className="text-xs text-muted">A tiny file cabinet, backed by GitHub.</p>
-            </div>
+    <div className="min-h-dvh">
+      <header className="border-b border-line bg-white/90">
+        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-7">
+          <div className="flex items-center gap-2.5">
+            <span className="flex size-9 items-center justify-center rounded-[11px] bg-[#3a3149] text-white"><HardDrive size={18} /></span>
+            <span className="text-[15px] font-semibold tracking-tight">RepoDrive</span>
+            <span className="hidden border-l border-line pl-3 text-xs text-muted sm:inline">Files, with a history.</span>
           </div>
-          {connection && (
-            <button className="flex min-h-11 items-center gap-2 rounded-lg px-2 text-sm text-muted hover:text-ink" onClick={() => {
-              setConnection(null); setItems([]); setSelected(null); setError(''); setPath('');
-            }}>
-              <LogOut size={17} /> <span className="hidden sm:inline">Disconnect</span>
-            </button>
+          {connection ? (
+            <div className="flex items-center gap-2">
+              <span className="hidden items-center gap-1.5 rounded-full bg-[#f0f8f1] px-2.5 py-1.5 text-[11px] font-medium text-[#48744c] sm:inline-flex">
+                <span className="size-1.5 rounded-full bg-[#68a16f]" /> Connected
+              </span>
+              <button className="action action-outline !min-h-9 !px-3" onClick={disconnect}><LogOut size={15} /> Disconnect</button>
+            </div>
+          ) : (
+            <span className="flex items-center gap-1.5 text-xs text-muted"><LockKeyhole size={14} /> Private by default</span>
           )}
         </div>
       </header>
 
-      <main className="mx-auto max-w-5xl px-4 pb-20 pt-7 sm:px-6 sm:pt-10">
+      <main className="mx-auto max-w-6xl px-4 pb-20 pt-8 sm:px-7 sm:pt-11">
         {!connection ? (
-          <section className="mx-auto max-w-lg">
-            <p className="mb-2 text-sm font-medium text-accent">Your files, your repository.</p>
-            <h2 className="text-3xl font-semibold tracking-tight sm:text-4xl">A simpler place for files.</h2>
-            <p className="mt-3 text-sm leading-6 text-muted">
-              Browse and manage a GitHub repository like a drive. Your access token stays in this tab
-              and is never saved to the site.
+          <section className="mx-auto max-w-[440px] pt-3 sm:pt-9">
+            <span className="mb-4 flex size-12 items-center justify-center rounded-2xl bg-[#ece6f7] text-accent">
+              <Folder size={24} strokeWidth={1.7} />
+            </span>
+            <h1 className="text-[27px] font-semibold tracking-tight sm:text-[34px]">Your files, minus the fuss.</h1>
+            <p className="mt-2.5 text-[13px] leading-6 text-muted">
+              A small file manager for a GitHub repository. Browse, organize, and keep every version.
             </p>
-            <form className="mt-8 space-y-5 rounded-2xl border border-line bg-white p-5 shadow-sm sm:p-7" onSubmit={(event) => {
-              event.preventDefault();
-              void connect();
-            }}>
-              <label className="block space-y-2">
-                <span className="text-sm font-medium">Storage repository</span>
-                <input className="min-h-12 w-full rounded-xl border border-line px-3.5 text-sm outline-none"
-                  placeholder="yourname/private-files" required value={repository}
-                  onChange={(event) => setRepository(event.target.value)} autoComplete="off" />
+            <form className="surface mt-7 space-y-4 p-5 sm:p-6" onSubmit={(event) => { event.preventDefault(); void connect(); }}>
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-medium">Storage repository</span>
+                <input className="field" placeholder="yourname/private-files" required value={repository}
+                  onChange={(event) => setRepository(event.target.value)} autoComplete="off" spellCheck={false} />
               </label>
-              <label className="block space-y-2">
-                <span className="text-sm font-medium">Fine-grained access token</span>
-                <input className="min-h-12 w-full rounded-xl border border-line px-3.5 text-sm outline-none"
-                  type="password" placeholder="github_pat_..." required value={token}
-                  onChange={(event) => setToken(event.target.value)} autoComplete="off" />
-              </label>
-              <p className="text-xs leading-5 text-muted">
-                Grant <strong>Contents: read and write</strong> on just the storage repository.
-                Never use a broad-scope personal token here.{' '}
-                <a className="text-accent underline underline-offset-2" href="https://github.com/settings/personal-access-tokens/new"
-                  target="_blank" rel="noopener noreferrer">Create token</a>
+              {oauthEnabled && !oauthToken && (
+                <button type="button" className="action action-primary !min-h-11 w-full" disabled={!!busy}
+                  onClick={() => { void beginGitHubLogin(repository.trim()).catch((reason: unknown) => setError(formatError(reason))); }}>
+                  <GitBranch size={17} /> Continue with GitHub
+                </button>
+              )}
+              {oauthToken && <div className="flex items-center gap-2 rounded-xl bg-[#f1f8f3] px-3 py-2.5 text-xs text-[#3e7650]">
+                <Check size={16} /> Authorized with GitHub for this session
+              </div>}
+              {!oauthToken && (
+                <div>
+                  {oauthEnabled ? <details className="group">
+                    <summary className="cursor-pointer text-xs text-muted">Use a personal access token instead</summary>
+                    <label className="mt-3 block">
+                      <span className="mb-1.5 block text-xs font-medium">Fine-grained GitHub token</span>
+                      <input className="field" type="password" placeholder="github_pat_…" value={token}
+                        onChange={(event) => setToken(event.target.value)} autoComplete="off" />
+                    </label>
+                  </details> : (
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-medium">Fine-grained GitHub token</span>
+                      <input className="field" type="password" placeholder="github_pat_…" required value={token}
+                        onChange={(event) => setToken(event.target.value)} autoComplete="off" />
+                    </label>
+                  )}
+                </div>
+              )}
+              {(!oauthEnabled || oauthToken || token.trim()) && (
+                <button className="action action-primary !min-h-11 w-full" type="submit" disabled={!!busy}>
+                  <ShieldCheck size={16} /> {busy || 'Open drive'}
+                </button>
+              )}
+              <p className="text-[11px] leading-5 text-muted">
+                {oauthEnabled ? 'Authorize only the storage repositories you want RepoDrive to access. ' : ''}
+                For manual tokens, grant <strong>Contents: read/write</strong> on just the storage repo.{' '}
+                <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer"
+                  className="font-medium text-accent underline underline-offset-2">Create a token</a>
               </p>
-              <button className={primary + ' w-full'} disabled={!!busy} type="submit">
-                <ShieldCheck size={17} /> {busy || 'Connect to repository'}
-              </button>
             </form>
-            <p className="mt-5 text-xs leading-5 text-muted">
-              Keep this website public and your storage in a separate private repository.
-              Refreshing the page disconnects you.
+            <p className="mt-5 text-center text-[11px] leading-5 text-muted">
+              No tracking or saved credentials. Refreshing the tab disconnects you.
             </p>
           </section>
         ) : (
-          <section>
-            <div className="mb-7 flex flex-col justify-between gap-3 sm:flex-row sm:items-end">
+          <section onDragEnter={onDragEnter} onDragLeave={onDragLeave} onDragOver={(event) => {
+            if (dragging) event.preventDefault();
+          }} onDrop={onDrop} className={'relative rounded-2xl transition ' + (dragging ? 'drop-target' : '')}>
+            {dragging && <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-2xl bg-[#f6f1ff]/95">
+              <div className="flex flex-col items-center gap-2 text-accent"><Upload size={30} /><span className="text-sm font-medium">Drop to upload here</span></div>
+            </div>}
+            <div className="mb-7 flex flex-wrap items-start justify-between gap-4">
               <div className="min-w-0">
-                <p className="mb-2 text-xs font-medium uppercase tracking-wider text-accent">
-                  {connection.repo.private ? 'Private repository' : 'Public repository'}
+                <a href={'https://github.com/' + connection.repo.full_name} target="_blank" rel="noopener noreferrer"
+                  className="inline-flex max-w-full items-center gap-1.5 text-[11px] font-medium text-muted hover:text-accent">
+                  <GitBranch size={13} /><span className="truncate">{connection.repo.full_name}</span><ExternalLink size={12} />
+                </a>
+                <h1 className="mt-2 truncate text-[26px] font-semibold tracking-tight sm:text-[31px]">
+                  {path ? segments.at(-1) : 'My files'}
+                </h1>
+                <p className="mt-1.5 text-xs text-muted">
+                  {fileCount} files · {folderCount} folders · {readableSize(folderBytes)} in this folder
                 </p>
-                <h2 className="truncate text-2xl font-semibold tracking-tight sm:text-3xl">
-                  {connection.repo.full_name}
-                </h2>
-                <p className="mt-1 text-xs text-muted">Branch: {connection.repo.default_branch} · Files are versioned in Git</p>
               </div>
-              <button className={secondary + ' self-start'} onClick={() => refresh()} disabled={!!busy} title="Refresh files">
-                <RefreshCw size={17} /> Refresh
-              </button>
+              <div className="flex items-center gap-2">
+                <button className="action action-outline" disabled={!!busy} onClick={() => setNameDialog({ type: 'folder' })}>
+                  <FolderPlus size={16} /><span className="hidden min-[370px]:inline">New folder</span>
+                </button>
+                <button className="action action-primary" disabled={!!busy} onClick={() => uploadRef.current?.click()}>
+                  <Upload size={16} /> Upload
+                </button>
+                <input ref={uploadRef} type="file" multiple className="hidden" aria-label="Upload files"
+                  onChange={(event) => {
+                    const files = Array.from(event.currentTarget.files || []);
+                    event.currentTarget.value = '';
+                    upload(files);
+                  }} />
+              </div>
             </div>
 
-            <div className="overflow-hidden rounded-2xl border border-line bg-white shadow-sm">
-              <div className="flex min-h-14 flex-wrap items-center gap-1 border-b border-line px-3 py-2 sm:px-5">
-                <button className="min-h-10 rounded-lg px-2 text-sm font-medium text-accent hover:bg-paper"
-                  onClick={() => { setPath(''); setFilter(''); }}>Files</button>
+            {busy && <p role="status" aria-live="polite" className="mb-3 text-xs text-accent">{busy}</p>}
+
+            <div className="surface overflow-hidden">
+              <div className="flex min-h-13 flex-wrap items-center gap-1 border-b border-line px-3 py-2 sm:px-4">
+                <button className="flex min-h-9 shrink-0 items-center gap-1 rounded-lg px-2.5 text-xs font-medium text-accent hover:bg-paper"
+                  onClick={() => navigate('')}><HardDrive size={14} /> Files</button>
                 {segments.map((segment, index) => (
                   <div className="flex min-w-0 items-center" key={index}>
-                    <ChevronRight size={14} className="shrink-0 text-muted" />
-                    <button className="max-w-40 truncate rounded-lg px-2 py-2 text-sm hover:bg-paper"
-                      onClick={() => { setPath(segments.slice(0, index + 1).join('/')); setFilter(''); }}>
-                      {segment}
-                    </button>
+                    <ChevronRight size={13} className="shrink-0 text-muted" />
+                    <button className="max-w-36 truncate rounded-lg px-2 py-2 text-xs hover:bg-paper sm:max-w-52"
+                      onClick={() => navigate(segments.slice(0, index + 1).join('/'))}>{segment}</button>
                   </div>
                 ))}
+                <span className="ml-auto flex items-center gap-1.5 rounded-lg bg-[#f5f4f7] px-2.5 py-1.5 text-[10px] text-muted">
+                  <GitBranch size={12} /><span className="max-w-20 truncate">{connection.repo.default_branch}</span>
+                </span>
               </div>
 
-              <div className="flex flex-col gap-3 border-b border-line p-3 sm:flex-row sm:items-center sm:justify-between sm:p-5">
-                <label className="flex min-h-11 items-center gap-2 rounded-xl border border-line px-3 sm:max-w-xs sm:flex-1">
-                  <Search size={17} className="text-muted" />
-                  <input className="w-full bg-transparent text-sm outline-none" placeholder="Filter this folder"
-                    value={filter} onChange={(event) => setFilter(event.target.value)} aria-label="Filter filenames" />
-                </label>
-                <div className="grid grid-cols-2 gap-2">
-                  <button className={secondary} onClick={addFolder} disabled={!!busy}>
-                    <FolderPlus size={18} /> New folder
-                  </button>
-                  <button className={primary} onClick={() => uploadRef.current?.click()} disabled={!!busy}>
-                    <Upload size={18} /> Upload
-                  </button>
-                  <input ref={uploadRef} className="hidden" type="file" multiple aria-label="Upload files"
-                    onChange={(event) => {
-                      const files = Array.from(event.currentTarget.files || []);
-                      event.currentTarget.value = '';
-                      upload(files);
-                    }} />
+              <div className="flex flex-col gap-3 px-3 py-3 sm:px-4">
+                <div className="flex gap-2">
+                  <label className="flex min-h-10 min-w-0 flex-1 items-center gap-2 rounded-[10px] border border-line bg-paper px-3 sm:max-w-sm">
+                    <Search size={16} className="shrink-0 text-muted" />
+                    <input className="w-full min-w-0 bg-transparent text-xs outline-none" value={filter}
+                      placeholder="Search this folder…" aria-label="Filter this folder" onChange={(event) => setFilter(event.target.value)} />
+                    {filter && <button aria-label="Clear search" onClick={() => setFilter('')}><X size={15} className="text-muted" /></button>}
+                  </label>
+                  <button className="flex size-10 shrink-0 items-center justify-center rounded-[10px] border border-line hover:bg-paper"
+                    title="Refresh" aria-label="Refresh folder" disabled={!!busy} onClick={refresh}><RefreshCw size={16} /></button>
+                </div>
+                <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-2">
+                  <div className="flex min-w-0 max-w-full items-center gap-0.5 overflow-x-auto">
+                    {categoryFilters.map((option) => (
+                      <button key={option.value} className="pill" aria-pressed={typeFilter === option.value}
+                        onClick={() => setTypeFilter(option.value)}>{option.label}</button>
+                    ))}
+                  </div>
+                  <div className="ml-auto flex shrink-0 items-center gap-1">
+                    <label className="relative flex items-center">
+                      <span className="sr-only">Sort files</span>
+                      <select className="min-h-9 appearance-none rounded-lg bg-white pl-2 pr-6 text-[11px] text-muted outline-none"
+                        value={sort} onChange={(event) => setSort(event.target.value as FileSort)}>
+                        <option value="name">Name</option>
+                        <option value="type">Type</option>
+                        <option value="size">Size</option>
+                      </select>
+                      <ChevronDown size={12} className="pointer-events-none absolute right-1.5 text-muted" />
+                    </label>
+                    <div className="mx-1 h-4 w-px bg-line" />
+                    <button title="List view" aria-label="List view" aria-pressed={view === 'list'}
+                      className="pill !flex !size-9 !items-center !justify-center !p-0" onClick={() => setView('list')}>
+                      <LayoutList size={17} />
+                    </button>
+                    <button title="Grid view" aria-label="Grid view" aria-pressed={view === 'grid'}
+                      className="pill !flex !size-9 !items-center !justify-center !p-0" onClick={() => setView('grid')}>
+                      <Grid2X2 size={16} />
+                    </button>
+                  </div>
                 </div>
               </div>
 
               {loading ? (
-                <div className="px-5 py-16 text-center text-sm text-muted">Loading files…</div>
+                <div className="py-18 text-center text-xs text-muted">Loading files…</div>
               ) : shown.length === 0 ? (
-                <div className="px-5 py-16 text-center">
-                  <Folder size={32} className="mx-auto mb-3 text-accent/50" />
-                  <p className="text-sm font-medium">{filter ? 'No matching files' : 'This folder is empty'}</p>
-                  <p className="mt-1 text-xs text-muted">{filter ? 'Try another search.' : 'Upload a file or create a folder.'}</p>
-                  {path && !filter && <button className="mt-4 rounded-xl border border-line bg-white px-4 py-3 text-xs text-muted hover:text-ink"
-                    onClick={removeEmptyFolder} disabled={!!busy}>Remove empty folder</button>}
+                <div className="px-5 py-17 text-center">
+                  <Folder size={30} strokeWidth={1.5} className="mx-auto mb-3 text-[#ad9bcf]" />
+                  <p className="text-sm font-medium">{items.length ? 'Nothing matches' : 'Nothing here yet'}</p>
+                  <p className="mt-1.5 text-xs text-muted">{items.length ? 'Try a different filter.' : 'Upload something or create a folder.'}</p>
+                  {!items.length && path && <button className="action action-outline mt-5" onClick={removeEmptyFolder} disabled={!!busy}>Remove empty folder</button>}
+                </div>
+              ) : view === 'list' ? (
+                <div>
+                  <div className="hidden grid-cols-[minmax(0,1fr)_minmax(100px,180px)_95px_24px] gap-3 border-b border-line bg-[#fbfafc] px-5 py-3 text-[10px] uppercase tracking-wider text-muted sm:grid">
+                    <span>Name</span><span>Type</span><span className="text-right">Size</span><span />
+                  </div>
+                  <div className="divide-y divide-line">
+                    {shown.map((item) => (
+                      <button key={item.path} disabled={!!busy} onClick={() => open(item)}
+                        className="grid min-h-17 w-full grid-cols-[minmax(0,1fr)_20px] items-center gap-3 px-3 py-2.5 text-left transition hover:bg-[#faf9fc] sm:grid-cols-[minmax(0,1fr)_minmax(100px,180px)_95px_24px] sm:px-5">
+                        <span className="flex min-w-0 items-center gap-3">
+                          <ItemIcon item={item} />
+                          <span className="min-w-0">
+                            <span className="block truncate text-[12px] font-medium">{item.name}</span>
+                            <span className="mt-1 block text-[10px] text-muted sm:hidden">
+                              {typeLabel(item)}{item.type === 'file' ? ' · ' + readableSize(item.size) : ''}
+                            </span>
+                          </span>
+                        </span>
+                        <span className="hidden truncate text-xs text-muted sm:block">{typeLabel(item)}</span>
+                        <span className="hidden text-right text-xs tabular-nums text-muted sm:block">
+                          {item.type === 'file' ? readableSize(item.size) : '—'}
+                        </span>
+                        <ChevronRight size={17} className="text-[#b0aab8]" />
+                      </button>
+                    ))}
+                  </div>
                 </div>
               ) : (
-                <div className="divide-y divide-line">
+                <div className="grid grid-cols-2 gap-3 border-t border-line p-3 sm:grid-cols-3 sm:p-5 lg:grid-cols-4">
                   {shown.map((item) => (
-                    <button key={item.path} className="flex min-h-16 w-full items-center gap-3 px-4 py-3 text-left hover:bg-paper sm:px-5"
-                      onClick={() => open(item)} disabled={!!busy}>
-                      <ItemIcon item={item} />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-sm font-medium">{item.name}</span>
-                        <span className="mt-1 block text-xs text-muted">{item.type === 'dir' ? 'Folder' : readableSize(item.size)}</span>
+                    <button key={item.path} disabled={!!busy} onClick={() => open(item)}
+                      className="flex min-h-38 min-w-0 flex-col items-start rounded-xl border border-line p-3.5 text-left hover:bg-[#faf9fc]">
+                      <ItemIcon item={item} large />
+                      <span className="mt-4 w-full truncate text-xs font-medium">{item.name}</span>
+                      <span className="mt-1.5 w-full truncate text-[10px] text-muted">
+                        {typeLabel(item)}{item.type === 'file' ? ' · ' + readableSize(item.size) : ''}
                       </span>
-                      <ChevronRight size={17} className="shrink-0 text-muted" />
                     </button>
                   ))}
                 </div>
               )}
-              {items.length >= 1000 && <p className="border-t border-line p-3 text-xs text-muted">GitHub lists at most 1,000 items per folder.</p>}
+              {items.length >= 1000 && <p className="border-t border-line px-4 py-3 text-xs text-muted">
+                GitHub only returns the first 1,000 entries per folder.
+              </p>}
             </div>
 
-            {path && (
-              <button className="mt-4 inline-flex min-h-11 items-center gap-2 text-sm text-muted hover:text-ink"
-                onClick={() => { setPath(segments.slice(0, -1).join('/')); setFilter(''); }}>
-                <ArrowLeft size={16} /> Back to parent folder
-              </button>
-            )}
-            <p className="mt-5 text-xs leading-5 text-muted">
-              10 MiB upload limit. Files stored in Git history still count toward repository size, even after deletion.
-            </p>
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted">
+              {path ? <button className="flex min-h-10 items-center gap-1.5 hover:text-ink"
+                onClick={() => navigate(segments.slice(0, -1).join('/'))}><ArrowLeft size={14} /> Parent folder</button> :
+                <span>{shown.length} items shown</span>}
+              <span>Max upload 10 MiB · Git-backed storage</span>
+            </div>
           </section>
         )}
-        {error && (
-          <div role="alert" className="mt-5 flex items-start justify-between gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-900">
-            <p className="break-words">{error}</p>
-            <button className="shrink-0" aria-label="Dismiss error" onClick={() => setError('')}><X size={18} /></button>
-          </div>
-        )}
+
+        {error && <div role="alert" className="mt-5 flex items-start justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-900">
+          <span className="break-words">{error}</span>
+          <button className="shrink-0" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button>
+        </div>}
       </main>
 
       {selected && connection && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center sm:p-5" role="presentation"
+        <div className="fixed inset-0 z-40 flex justify-end bg-[#201b2b]/30" role="presentation"
           onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
-          <section className="flex max-h-[92dvh] w-full max-w-2xl flex-col overflow-hidden rounded-t-3xl bg-white shadow-xl sm:rounded-2xl"
-            role="dialog" aria-modal="true" aria-label={'Preview ' + selected.name}>
-            <div className="flex items-center gap-3 border-b border-line p-4 sm:px-5">
-              <ItemIcon item={selected} />
-              <div className="min-w-0 flex-1">
-                <h3 className="truncate text-sm font-semibold">{selected.name}</h3>
-                <p className="text-xs text-muted">{readableSize(selected.size)}</p>
-                <a className="mt-1 inline-block text-xs text-accent underline underline-offset-2" target="_blank" rel="noopener noreferrer"
-                  href={'https://github.com/' + connection.repo.full_name + '/commits/' + encodeURIComponent(connection.repo.default_branch) + '/' + encodePath(selected.path)}>
-                  View file history
-                </a>
+          <section className="flex h-dvh w-full max-w-lg flex-col bg-white shadow-2xl" role="dialog" aria-modal="true"
+            aria-label={'File details: ' + selected.name}>
+            <header className="flex min-h-16 items-center gap-3 border-b border-line px-4 sm:px-6">
+              <span className="min-w-0 flex-1 truncate text-sm font-medium">File details</span>
+              <button className="flex size-10 items-center justify-center rounded-lg hover:bg-paper" aria-label="Close details"
+                onClick={() => setSelected(null)}><X size={19} /></button>
+            </header>
+            <div className="min-h-0 flex-1 overflow-auto p-5 sm:p-6">
+              <div className="mb-6 flex min-w-0 items-center gap-3">
+                <ItemIcon item={selected} large />
+                <div className="min-w-0">
+                  <h2 className="break-all text-sm font-medium">{selected.name}</h2>
+                  <p className="mt-1 text-xs text-muted">{typeLabel(selected)} · {readableSize(selected.size)}</p>
+                </div>
               </div>
-              <button className="flex size-11 items-center justify-center rounded-xl hover:bg-paper"
-                aria-label="Close preview" onClick={() => setSelected(null)}><X size={19} /></button>
+
+              <div className="min-h-24 overflow-auto rounded-xl border border-line bg-paper p-3">
+                {preview.kind === 'loading' && <p className="py-10 text-center text-xs text-muted">Loading preview…</p>}
+                {preview.kind === 'image' && <img src={preview.value} alt={selected.name}
+                  className="mx-auto max-h-[42dvh] max-w-full rounded-lg object-contain" />}
+                {preview.kind === 'text' && <pre className="max-h-[42dvh] overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-5">{preview.value}</pre>}
+                {preview.kind === 'other' && <p className="py-10 text-center text-xs text-muted">No preview available. Download to open.</p>}
+                {preview.kind === 'error' && <p className="py-10 text-center text-xs text-red-700">Preview failed: {preview.value}</p>}
+              </div>
+
+              <div className="mt-7 flex items-center justify-between">
+                <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted">Properties</h3>
+                <button className="flex items-center gap-1 text-[11px] text-accent hover:underline" onClick={() => void copyPath(selected)}>
+                  {copied ? <Check size={13} /> : <Copy size={13} />}{copied ? 'Copied' : 'Copy path'}
+                </button>
+              </div>
+              <dl className="mt-3 divide-y divide-line border-t border-line text-xs">
+                <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-3 py-3">
+                  <dt className="text-muted">Location</dt><dd className="break-all">{selected.path}</dd>
+                </div>
+                <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-3 py-3">
+                  <dt className="text-muted">Size</dt><dd>{readableSize(selected.size)} ({selected.size.toLocaleString()} bytes)</dd>
+                </div>
+                <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-3 py-3">
+                  <dt className="text-muted">Version</dt><dd className="break-all font-mono text-[11px]">{selected.sha.slice(0, 12)}</dd>
+                </div>
+                <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-3 py-3">
+                  <dt className="text-muted">Repository</dt><dd className="break-all">{connection.repo.full_name}</dd>
+                </div>
+              </dl>
+              <a href={'https://github.com/' + connection.repo.full_name + '/commits/' +
+                encodeURIComponent(connection.repo.default_branch) + '/' + encodePath(selected.path)}
+                target="_blank" rel="noopener noreferrer" className="mt-4 inline-flex items-center gap-1.5 text-xs text-accent hover:underline">
+                <GitBranch size={14} /> File history <ExternalLink size={12} />
+              </a>
             </div>
-            <div className="min-h-28 flex-1 overflow-auto bg-paper p-4">
-              {preview.kind === 'loading' && <p className="py-10 text-center text-sm text-muted">Loading preview…</p>}
-              {preview.kind === 'image' && <img className="mx-auto max-h-[52dvh] max-w-full rounded-lg object-contain"
-                src={preview.value} alt={selected.name} />}
-              {preview.kind === 'text' && <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-xl bg-white p-4 font-mono text-xs leading-5">{preview.value}</pre>}
-              {preview.kind === 'other' && <p className="py-10 text-center text-sm text-muted">No inline preview for this file. Download to open it.</p>}
-              {preview.kind === 'error' && <p className="py-10 text-center text-sm text-red-700">Preview unavailable: {preview.value}</p>}
-            </div>
-            {error && <p role="alert" className="border-t border-red-200 bg-red-50 px-4 py-3 text-xs text-red-900">{error}</p>}
-            <div className="grid grid-cols-3 gap-2 border-t border-line p-3 sm:p-4">
-              <button className={secondary} disabled={!!busy} onClick={() => rename(selected)}><Pencil size={16} /> Rename</button>
-              <button className={secondary} disabled={!!busy} onClick={() => remove(selected)}><Trash2 size={16} /> Delete</button>
-              <button className={primary} disabled={!!busy} onClick={() => download(selected)}>
-                <ArrowDownToLine size={16} /> Save
+            {error && <p role="alert" className="border-t border-red-200 bg-red-50 px-5 py-3 text-xs text-red-900">{error}</p>}
+            <div className="grid grid-cols-3 gap-2 border-t border-line bg-white p-4 sm:px-6">
+              <button className="action action-outline !px-2" disabled={!!busy}
+                onClick={() => setNameDialog({ type: 'rename', item: selected })}><Pencil size={15} /> Rename</button>
+              <button className="action action-outline !px-2" disabled={!!busy} onClick={() => remove(selected)}>
+                <Trash2 size={15} /> Delete
+              </button>
+              <button className="action action-primary !px-2" disabled={!!busy} onClick={() => download(selected)}>
+                <ArrowDownToLine size={15} /> Download
               </button>
             </div>
           </section>
         </div>
       )}
 
-      <footer className="mx-auto flex max-w-5xl items-center justify-center gap-2 px-4 pb-6 text-xs text-muted">
-        <GitBranch size={15} /> Powered by GitHub's Contents API. No server of its own.
-      </footer>
+      {nameDialog && (
+        <NameEditor key={nameDialog.item?.path || 'new-folder'}
+          title={nameDialog.type === 'folder' ? 'New folder' : 'Rename file'}
+          value={nameDialog.item?.name || ''} onCancel={() => setNameDialog(null)} onSave={saveName} />
+      )}
+      <footer className="pb-7 text-center text-[11px] text-muted">Small files. Real history. Built on GitHub.</footer>
     </div>
   );
 }
