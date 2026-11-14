@@ -1,0 +1,19 @@
+@import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700&display=swap');
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Rubik', ui-sans-serif, system-ui, sans-serif;
+  --color-paper: #faf9fd;
+  --color-ink: #242335;
+  --color-muted: #797588;
+  --color-line: #e6e2ed;
+  --color-accent: #6845bb;
+}
+
+:root { font-family: var(--font-sans); color: var(--color-ink); background: var(--color-paper); }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .55; }
+input:focus-visible, button:focus-visible, a:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
