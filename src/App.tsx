@@ -6,13 +6,17 @@ import {
   Search, ShieldCheck, Trash2, Upload, X,
 } from 'lucide-react';
 import { encodePath, Entry, GitHubDrive, MAX_UPLOAD_BYTES, RepoDetails } from './github';
+import { PUBLIC_FOLDER, VaultDrive, UploadProgress } from './vault';
+import { RemoteBlockStore } from './remote-blocks';
+import { offerToSaveVaultPassword } from './browser-password';
 import { beginGitHubLogin, completeGitHubLogin, oauthEnabled } from './auth';
 import {
   category, entriesBy, extension, FileCategory, FileSort, PREVIEW_IMAGES, PREVIEW_TEXT,
   readableSize, typeLabel, validName,
 } from './file';
 
-type Connection = { api: GitHubDrive; repo: RepoDetails };
+type Connection = { api: VaultDrive; repo: RepoDetails };
+type Pending = { github: GitHubDrive; repo: RepoDetails; exists: boolean; remote?: RemoteBlockStore };
 type Preview = { kind: 'loading' | 'text' | 'image' | 'other' | 'error'; value?: string };
 type NameDialog = { type: 'folder' | 'rename'; item?: Entry };
 type View = 'list' | 'grid';
@@ -25,7 +29,7 @@ const categoryFilters: { value: FileCategory; label: string }[] = [
 ];
 
 function ItemIcon({ item, large = false }: { item: Entry; large?: boolean }) {
-  const size = large ? 27 : 21;
+  const size = large ? 24 : 20;
   const kind = category(item);
   const icon = kind === 'folder' ? <Folder size={size} /> :
     kind === 'images' ? <ImageIcon size={size} /> :
@@ -33,8 +37,8 @@ function ItemIcon({ item, large = false }: { item: Entry; large?: boolean }) {
     kind === 'code' ? <Code2 size={size} /> :
     ['zip', 'tar', 'gz', '7z', 'rar'].includes(extension(item.name)) ? <FileArchive size={size} /> :
     <File size={size} />;
-  return <span className={'flex shrink-0 items-center justify-center rounded-xl ' +
-    (large ? 'size-12' : 'size-10') + (kind === 'folder' ? ' bg-[#f0ebf9] text-accent' : ' bg-[#f6f5f8] text-[#8d8799]')}>
+  return <span className={'flex shrink-0 items-center justify-center ' +
+    (large ? 'size-10' : 'size-8') + (kind === 'folder' ? ' text-accent' : ' text-muted')}>
     {icon}
   </span>;
 }
@@ -51,9 +55,9 @@ function NameEditor({ title, value, onCancel, onSave }: {
 }) {
   const [name, setName] = useState(value);
   return (
-    <div className="fixed inset-0 z-60 flex items-center justify-center bg-[#201b2b]/35 p-4"
+    <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/30 p-4"
       onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
-      <form className="surface w-full max-w-sm p-5 shadow-xl" onSubmit={(event) => {
+      <form className="surface w-full max-w-sm p-5" onSubmit={(event) => {
         event.preventDefault();
         onSave(name.trim());
       }}>
@@ -71,10 +75,13 @@ function NameEditor({ title, value, onCancel, onSave }: {
 }
 
 export default function App() {
-  const [repository, setRepository] = useState('');
+  const [repository, setRepository] = useState(import.meta.env.VITE_DEFAULT_STORAGE_REPO || '');
   const [token, setToken] = useState('');
   const [oauthToken, setOauthToken] = useState('');
   const [connection, setConnection] = useState<Connection | null>(null);
+  const [pending, setPending] = useState<Pending | null>(null);
+  const vaultForm = useRef<HTMLFormElement>(null);
+  const [acknowledged, setAcknowledged] = useState(false);
   const [path, setPath] = useState('');
   const [items, setItems] = useState<Entry[]>([]);
   const [filter, setFilter] = useState('');
@@ -92,6 +99,9 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const uploadRef = useRef<HTMLInputElement>(null);
   const dragDepth = useRef(0);
+  const uploadController = useRef<AbortController | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<(UploadProgress & { name: string }) | null>(null);
+  const [resume, setResume] = useState<{ path: string; done: number; total: number } | null>(null);
 
   const shown = useMemo(() => entriesBy(items.filter((item) =>
     item.name.toLowerCase().includes(filter.trim().toLowerCase()) &&
@@ -104,6 +114,14 @@ export default function App() {
   const segments = path ? path.split('/') : [];
 
   function refresh() { setVersion((value) => value + 1); }
+
+  function refreshFromGitHub() {
+    if (!connection) return;
+    void perform('Refreshing…', async () => {
+      await connection.api.reload();
+      refresh();
+    });
+  }
 
   async function perform(label: string, job: () => Promise<void>) {
     if (busy) return;
@@ -118,8 +136,6 @@ export default function App() {
     if (!connection) return;
     let active = true;
     setLoading(true);
-    setError('');
-    setItems([]);
     connection.api.list(path, connection.repo.default_branch)
       .then((entries) => { if (active) setItems(entries); })
       .catch((reason: unknown) => { if (active) setError(formatError(reason)); })
@@ -180,7 +196,10 @@ export default function App() {
       const api = new GitHubDrive(secret.trim(), target.trim());
       const repo = await api.details();
       await api.list('', repo.default_branch);
-      setConnection({ api, repo });
+      const exists = await VaultDrive.exists(api, repo.default_branch);
+      const endpoint = import.meta.env.VITE_BLOCK_WORKER_URL;
+      setPending({ github: api, repo, exists,
+        remote: endpoint ? new RemoteBlockStore(endpoint, secret.trim()) : undefined });
       setToken('');
       setPath('');
     });
@@ -203,10 +222,38 @@ export default function App() {
     return () => { active = false; };
   }, []);
 
+  async function unlockVault() {
+    if (!pending || !vaultForm.current) return;
+    // Some password managers autofill without firing React change events.
+    const fields = new FormData(vaultForm.current);
+    const password = String(fields.get('password') || '');
+    const confirmation = String(fields.get('confirm-password') || '');
+    if (!pending.exists) {
+      if (password.length < 14) { setError('Use a password or passphrase of at least 14 characters.'); return; }
+      if (password !== confirmation) { setError('Passwords do not match.'); return; }
+      if (!acknowledged) { setError('Please acknowledge the recovery and Git history warnings.'); return; }
+    }
+    await perform(pending.exists ? 'Unlocking vault…' : 'Encrypting new vault…', async () => {
+      const api = pending.exists
+        ? await VaultDrive.unlock(pending.github, pending.repo.default_branch, password, pending.remote)
+        : await VaultDrive.create(pending.github, pending.repo.default_branch, password, pending.remote);
+      const interrupted = await api.pendingUpload();
+      setResume(interrupted);
+      offerToSaveVaultPassword(pending.repo.full_name, password);
+      setConnection({ api, repo: pending.repo });
+      setPending(null);
+      vaultForm.current?.reset();
+      setAcknowledged(false);
+      setPath(interrupted ? interrupted.path.split('/').slice(0, -1).join('/') : '');
+    });
+  }
+
   function navigate(next: string) {
+    setError('');
     setFilter('');
     setTypeFilter('all');
     setSelected(null);
+    if (next !== path) setItems([]);
     setPath(next);
   }
 
@@ -217,19 +264,43 @@ export default function App() {
   }
 
   function upload(files: File[]) {
-    if (!connection || files.length === 0) return;
+    if (!connection || files.length === 0 || busy) return;
+    const publicUpload = path === PUBLIC_FOLDER || path.startsWith(PUBLIC_FOLDER + '/');
+    if (publicUpload && !window.confirm(
+      'PUBLIC AND UNENCRYPTED: uploaded files will be readable by anyone and Git history may retain them forever. Continue?'
+    )) return;
+    const destination = path;
+    const controller = new AbortController();
+    uploadController.current = controller;
     void perform('Uploading…', async () => {
       try {
         for (const file of files) {
+          controller.signal.throwIfAborted();
           if (!validName(file.name)) throw new Error('Invalid filename: ' + file.name);
-          if (file.size > MAX_UPLOAD_BYTES) throw new Error(file.name + ' exceeds the 10 MiB limit.');
+          const max = publicUpload ? MAX_UPLOAD_BYTES : connection.api.maxUploadBytes;
+          if (file.size > max) {
+            throw new Error(file.name + (publicUpload
+              ? ' is too large for public Git storage (10 MiB max).'
+              : ' exceeds the storage limit. Configure an R2 Worker for large uploads.'));
+          }
           const existing = items.find((item) => item.name === file.name);
           if (existing?.type === 'dir') throw new Error('A folder already uses the name ' + file.name);
           if (existing && !window.confirm('Replace ' + file.name + '?')) continue;
-          await connection.api.write([path, file.name].filter(Boolean).join('/'),
-            new Uint8Array(await file.arrayBuffer()), existing?.sha);
+          const nextPath = [destination, file.name].filter(Boolean).join('/');
+          setUploadProgress({ name: file.name, done: 0, total: file.size });
+          await connection.api.writeFile(nextPath, file, existing?.sha,
+            (progress) => setUploadProgress({ name: file.name, ...progress }), controller.signal);
+          setResume(await connection.api.pendingUpload());
+          refresh();
         }
-      } finally { refresh(); }
+      } catch (error) {
+        if ((error as DOMException).name !== 'AbortError') throw error;
+      } finally {
+        setResume(await connection.api.pendingUpload().catch(() => null));
+        setUploadProgress(null);
+        uploadController.current = null;
+        refresh();
+      }
     });
   }
 
@@ -270,18 +341,14 @@ export default function App() {
         refresh();
       });
     } else if (target) {
-      if (target.size > MAX_UPLOAD_BYTES) { setError('Files over 10 MiB cannot be renamed.'); return; }
+      if (target.path.startsWith(PUBLIC_FOLDER + '/') && target.size > MAX_UPLOAD_BYTES) {
+        setError('Public files over 10 MiB cannot be renamed.');
+        return;
+      }
       void perform('Renaming…', async () => {
-        const newPath = [path, name].filter(Boolean).join('/');
-        const blob = await connection.api.read(target.path, connection.repo.default_branch);
-        await connection.api.write(newPath, new Uint8Array(await blob.arrayBuffer()));
-        try { await connection.api.delete(target.path, target.sha); }
-        catch (reason) {
-          refresh();
-          throw new Error('New file created, but the original could not be deleted. Both may exist. ' + formatError(reason));
-        }
-        setSelected(null);
-        refresh();
+        const nextPath = [path, name].filter(Boolean).join('/');
+        try { await connection.api.rename(target.path, nextPath, target.sha); }
+        finally { setSelected(null); refresh(); }
       });
     }
   }
@@ -289,25 +356,59 @@ export default function App() {
   function remove(item: Entry) {
     if (!connection || !window.confirm('Delete ' + item.name + '? Git history will retain earlier versions.')) return;
     void perform('Deleting…', async () => {
-      await connection.api.delete(item.path, item.sha);
-      setSelected(null);
-      refresh();
+      try { await connection.api.delete(item.path, item.sha); }
+      finally { setSelected(null); refresh(); }
     });
   }
 
   function removeEmptyFolder() {
     if (!connection || !path || !window.confirm('Remove this empty folder?')) return;
     void perform('Deleting folder…', async () => {
-      await connection.api.deleteEmptyFolder(path, connection.repo.default_branch);
-      navigate(segments.slice(0, -1).join('/'));
-      refresh();
+      try {
+        await connection.api.deleteEmptyFolder(path, connection.repo.default_branch);
+        navigate(segments.slice(0, -1).join('/'));
+      } finally { refresh(); }
     });
   }
 
   function download(item: Entry) {
     if (!connection) return;
+    type SaveHandle = { createWritable(): Promise<{
+      write(data: Uint8Array): Promise<void>;
+      close(): Promise<void>;
+      abort(): Promise<void>;
+    }> };
+    const picker = (window as Window & {
+      showSaveFilePicker?: (options: { suggestedName: string }) => Promise<SaveHandle>;
+    }).showSaveFilePicker;
+
+    // The picker is invoked directly from the click to preserve user activation.
     void perform('Downloading…', async () => {
-      const blob = await connection.api.read(item.path, connection.repo.default_branch);
+      if (picker && !item.path.startsWith(PUBLIC_FOLDER + '/')) {
+        let handle: SaveHandle;
+        try { handle = await picker.call(window, { suggestedName: item.name }); }
+        catch (error) {
+          if ((error as DOMException).name === 'AbortError') return;
+          throw error;
+        }
+        const writable = await handle.createWritable();
+        try {
+          await connection.api.downloadTo(item.path, (chunk) => writable.write(chunk));
+          await writable.close();
+        } catch (error) { await writable.abort().catch(() => {}); throw error; }
+        return;
+      }
+      if (item.size > 64 * 1024 * 1024) {
+        throw new Error('Downloads over 64 MiB require streaming Save As support (Chromium desktop).');
+      }
+      let blob: Blob;
+      if (item.size > MAX_UPLOAD_BYTES && !item.path.startsWith(PUBLIC_FOLDER + '/')) {
+        const chunks: Uint8Array[] = [];
+        await connection.api.downloadTo(item.path, async (chunk) => { chunks.push(new Uint8Array(chunk)); });
+        blob = new Blob(chunks.map((part) => new Uint8Array(part)));
+      } else {
+        blob = await connection.api.read(item.path, connection.repo.default_branch);
+      }
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = url;
@@ -327,6 +428,11 @@ export default function App() {
   }
 
   function disconnect() {
+    uploadController.current?.abort();
+    setUploadProgress(null);
+    setResume(null);
+    setPending(null);
+    setAcknowledged(false);
     setOauthToken('');
     setToken('');
     setConnection(null);
@@ -338,37 +444,93 @@ export default function App() {
 
   return (
     <div className="min-h-dvh">
-      <header className="border-b border-line bg-white/90">
-        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-7">
-          <div className="flex items-center gap-2.5">
-            <span className="flex size-9 items-center justify-center rounded-[11px] bg-[#3a3149] text-white"><HardDrive size={18} /></span>
-            <span className="text-[15px] font-semibold tracking-tight">RepoDrive</span>
-            <span className="hidden border-l border-line pl-3 text-xs text-muted sm:inline">Files, with a history.</span>
-          </div>
-          {connection ? (
-            <div className="flex items-center gap-2">
-              <span className="hidden items-center gap-1.5 rounded-full bg-[#f0f8f1] px-2.5 py-1.5 text-[11px] font-medium text-[#48744c] sm:inline-flex">
-                <span className="size-1.5 rounded-full bg-[#68a16f]" /> Connected
-              </span>
-              <button className="action action-outline !min-h-9 !px-3" onClick={disconnect}><LogOut size={15} /> Disconnect</button>
-            </div>
-          ) : (
-            <span className="flex items-center gap-1.5 text-xs text-muted"><LockKeyhole size={14} /> Private by default</span>
+      <header className="border-b border-line bg-white">
+        <div className="mx-auto flex h-14 max-w-5xl items-center justify-between px-4 sm:px-6">
+          <span className="text-[15px] font-medium tracking-tight">My Drive</span>
+          {connection && (
+            <button className="action action-outline !min-h-9 !px-3" disabled={!!busy} onClick={disconnect}>
+              <LogOut size={15} /> Disconnect
+            </button>
           )}
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl px-4 pb-20 pt-8 sm:px-7 sm:pt-11">
-        {!connection ? (
-          <section className="mx-auto max-w-[440px] pt-3 sm:pt-9">
-            <span className="mb-4 flex size-12 items-center justify-center rounded-2xl bg-[#ece6f7] text-accent">
-              <Folder size={24} strokeWidth={1.7} />
-            </span>
-            <h1 className="text-[27px] font-semibold tracking-tight sm:text-[34px]">Your files, minus the fuss.</h1>
-            <p className="mt-2.5 text-[13px] leading-6 text-muted">
-              A small file manager for a GitHub repository. Browse, organize, and keep every version.
+      <main className="mx-auto max-w-5xl px-4 pb-12 pt-7 sm:px-6 sm:pt-9">
+        {error && !selected && (
+          <div role="alert" className="sticky top-2 z-30 mb-5 flex items-start justify-between gap-3 border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-900">
+            <span className="min-w-0 break-words">{error}</span>
+            <button className="shrink-0" aria-label="Dismiss error" onClick={() => setError('')}>
+              <X size={16} />
+            </button>
+          </div>
+        )}
+        {!connection && pending ? (
+          <section className="mx-auto max-w-[460px] pt-2 sm:pt-6">
+            <h1 className="text-[23px] font-medium tracking-tight">
+              {pending.exists ? 'Unlock vault' : 'Set up encrypted vault'}
+            </h1>
+            <p className="mt-2 text-[13px] leading-6 text-muted">
+              {pending.exists
+                ? 'Enter your vault password to decrypt files locally.'
+                : 'Files and folder names are encrypted in your browser before upload.'}
             </p>
-            <form className="surface mt-7 space-y-4 p-5 sm:p-6" onSubmit={(event) => { event.preventDefault(); void connect(); }}>
+            {!pending.exists && (
+              <div className="mt-6 border-y border-line py-4">
+                <h2 className="mb-3 text-xs font-medium">Before you start</h2>
+                <ol className="space-y-2 text-xs leading-5 text-muted">
+                  <li>1. Choose a unique password you can retain securely.</li>
+                  <li>2. The browser derives an encryption key using Argon2id and a random salt.</li>
+                  <li>3. Upload to the encrypted drive. Only <strong>Public files</strong> is unencrypted.</li>
+                </ol>
+              </div>
+            )}
+            <form key={pending.repo.full_name + (pending.exists ? ':unlock' : ':setup')} ref={vaultForm}
+              className="mt-5 space-y-4" autoComplete="on"
+              onSubmit={(event) => { event.preventDefault(); void unlockVault(); }}>
+              <input type="text" id="vault-username" name="username" autoComplete="username" readOnly
+                value={pending.repo.full_name} className="sr-only" tabIndex={-1} aria-hidden="true" />
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-medium">{pending.exists ? 'Vault password' : 'New vault password'}</span>
+                <input type="password" id={pending.exists ? 'current-password' : 'new-password'}
+                  name="password" className="field" required
+                  autoComplete={pending.exists ? 'current-password' : 'new-password'}
+                  placeholder="Enter a strong passphrase" />
+              </label>
+              {!pending.exists && (
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-medium">Confirm password</span>
+                  <input type="password" id="confirm-password" name="confirm-password" className="field" required
+                    autoComplete="new-password" placeholder="Enter the same passphrase again" />
+                </label>
+              )}
+              {!pending.exists && (
+                <label className="flex cursor-pointer items-start gap-2.5 border-l-2 border-[#9b845e] bg-[#f6f5f2] p-3">
+                  <input type="checkbox" className="mt-1 accent-[#5c4b72]" checked={acknowledged}
+                    onChange={(event) => setAcknowledged(event.target.checked)} />
+                  <span className="text-xs leading-5 text-[#5b5146]">
+                    <strong>Git history retains deleted files.</strong>
+                    I understand that public uploads are never encrypted, and losing my password
+                    permanently loses access to encrypted files. There is no password reset.
+                  </span>
+                </label>
+              )}
+              <button type="submit" className="action action-primary !min-h-11 w-full" disabled={!!busy}>
+                <LockKeyhole size={16} /> {busy || (pending.exists ? 'Unlock drive' : 'Create encrypted drive')}
+              </button>
+            </form>
+            <p className="mt-4 text-xs leading-5 text-muted">
+              Your browser may offer to save the vault password in its password manager.
+            </p>
+            <button className="mt-3 flex min-h-10 items-center gap-2 text-xs text-muted hover:text-ink"
+              onClick={disconnect}><ArrowLeft size={14} /> Back</button>
+          </section>
+        ) : !connection ? (
+          <section className="mx-auto max-w-[440px] pt-3 sm:pt-7">
+            <h1 className="text-[23px] font-medium tracking-tight">Connect to GitHub</h1>
+            <p className="mt-2 text-[13px] leading-6 text-muted">
+              Connect to the storage repository. New vaults have guided setup.
+            </p>
+            <form className="mt-6 space-y-4" onSubmit={(event) => { event.preventDefault(); void connect(); }}>
               <label className="block">
                 <span className="mb-1.5 block text-xs font-medium">Storage repository</span>
                 <input className="field" placeholder="yourname/private-files" required value={repository}
@@ -380,7 +542,7 @@ export default function App() {
                   <GitBranch size={17} /> Continue with GitHub
                 </button>
               )}
-              {oauthToken && <div className="flex items-center gap-2 rounded-xl bg-[#f1f8f3] px-3 py-2.5 text-xs text-[#3e7650]">
+              {oauthToken && <div className="flex items-center gap-2 text-xs text-muted">
                 <Check size={16} /> Authorized with GitHub for this session
               </div>}
               {!oauthToken && (
@@ -413,28 +575,38 @@ export default function App() {
                   className="font-medium text-accent underline underline-offset-2">Create a token</a>
               </p>
             </form>
-            <p className="mt-5 text-center text-[11px] leading-5 text-muted">
-              No tracking or saved credentials. Refreshing the tab disconnects you.
+            <p className="mt-5 text-xs leading-5 text-muted">
+              Credentials are held in memory. Refresh to disconnect.
             </p>
           </section>
         ) : (
           <section onDragEnter={onDragEnter} onDragLeave={onDragLeave} onDragOver={(event) => {
             if (dragging) event.preventDefault();
-          }} onDrop={onDrop} className={'relative rounded-2xl transition ' + (dragging ? 'drop-target' : '')}>
-            {dragging && <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-2xl bg-[#f6f1ff]/95">
+          }} onDrop={onDrop} className={'relative transition ' + (dragging ? 'drop-target' : '')}>
+            {dragging && <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-paper/95">
               <div className="flex flex-col items-center gap-2 text-accent"><Upload size={30} /><span className="text-sm font-medium">Drop to upload here</span></div>
             </div>}
-            <div className="mb-7 flex flex-wrap items-start justify-between gap-4">
+            {path === PUBLIC_FOLDER || path.startsWith(PUBLIC_FOLDER + '/') ? (
+              <div className="mb-5 border-l-2 border-[#9b845e] bg-[#f6f5f2] px-3 py-2.5 text-xs leading-5 text-[#5b5146]">
+                <strong>Public and unencrypted.</strong> Everything uploaded here is readable if this repository is public,
+                and deletion does not erase its Git history.
+              </div>
+            ) : (
+              <div className="mb-4 flex items-center gap-1.5 text-xs text-muted">
+                <LockKeyhole size={13} /> Encrypted · AES-256-GCM
+              </div>
+            )}
+            <div className="mb-5 flex flex-wrap items-end justify-between gap-4">
               <div className="min-w-0">
                 <a href={'https://github.com/' + connection.repo.full_name} target="_blank" rel="noopener noreferrer"
                   className="inline-flex max-w-full items-center gap-1.5 text-[11px] font-medium text-muted hover:text-accent">
                   <GitBranch size={13} /><span className="truncate">{connection.repo.full_name}</span><ExternalLink size={12} />
                 </a>
-                <h1 className="mt-2 truncate text-[26px] font-semibold tracking-tight sm:text-[31px]">
-                  {path ? segments.at(-1) : 'My files'}
+                <h1 className="mt-1 truncate text-[23px] font-medium tracking-tight sm:text-[26px]">
+                  {path ? segments.at(-1) : 'Files'}
                 </h1>
                 <p className="mt-1.5 text-xs text-muted">
-                  {fileCount} files · {folderCount} folders · {readableSize(folderBytes)} in this folder
+                  {fileCount} {fileCount === 1 ? 'file' : 'files'} · {folderCount} {folderCount === 1 ? 'folder' : 'folders'} · {readableSize(folderBytes)}
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -453,34 +625,68 @@ export default function App() {
               </div>
             </div>
 
-            {busy && <p role="status" aria-live="polite" className="mb-3 text-xs text-accent">{busy}</p>}
+            {resume && !busy && (
+              <div className="mb-3 flex items-start justify-between gap-3 border border-line bg-white px-3 py-2.5 text-xs">
+                <span className="min-w-0 break-words">
+                  Interrupted upload: <strong>{resume.path}</strong> ({Math.round(100 * resume.done / Math.max(resume.total, 1))}%).
+                  Re-select the same file to resume.
+                </span>
+                <div className="flex shrink-0 gap-3">
+                  <button className="underline" onClick={() =>
+                    navigate(resume.path.split('/').slice(0, -1).join('/'))}>Open folder</button>
+                  <button className="underline" onClick={() => {
+                    connection.api.discardPendingUpload(); setResume(null);
+                  }}>Discard</button>
+                </div>
+              </div>
+            )}
+            {uploadProgress && (
+              <div className="mb-3 border border-line bg-white px-3 py-2.5 text-xs" role="status" aria-live="polite">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="min-w-0 truncate">{uploadProgress.name}</span>
+                  <span className="shrink-0 tabular-nums">
+                    {readableSize(uploadProgress.done)} / {readableSize(uploadProgress.total)}
+                  </span>
+                  {uploadProgress.done >= uploadProgress.total ? (
+                    <span className="shrink-0 text-muted">Finalizing…</span>
+                  ) : (
+                    <button className="shrink-0 underline" onClick={() => uploadController.current?.abort()}>
+                      {connection.api.maxUploadBytes > MAX_UPLOAD_BYTES ? 'Cancel' : 'Stop after file'}
+                    </button>
+                  )}
+                </div>
+                <progress className="mt-2 h-1.5 w-full accent-accent" max={Math.max(1, uploadProgress.total)}
+                  value={uploadProgress.done} aria-label="Upload progress" />
+              </div>
+            )}
+            {busy && !uploadProgress && <p role="status" className="mb-3 text-xs text-muted">{busy}</p>}
 
             <div className="surface overflow-hidden">
               <div className="flex min-h-13 flex-wrap items-center gap-1 border-b border-line px-3 py-2 sm:px-4">
-                <button className="flex min-h-9 shrink-0 items-center gap-1 rounded-lg px-2.5 text-xs font-medium text-accent hover:bg-paper"
+                <button className="flex min-h-9 shrink-0 items-center gap-1 rounded-[4px] px-2.5 text-xs font-medium text-accent hover:bg-paper"
                   onClick={() => navigate('')}><HardDrive size={14} /> Files</button>
                 {segments.map((segment, index) => (
                   <div className="flex min-w-0 items-center" key={index}>
                     <ChevronRight size={13} className="shrink-0 text-muted" />
-                    <button className="max-w-36 truncate rounded-lg px-2 py-2 text-xs hover:bg-paper sm:max-w-52"
+                    <button className="max-w-36 truncate rounded-[4px] px-2 py-2 text-xs hover:bg-paper sm:max-w-52"
                       onClick={() => navigate(segments.slice(0, index + 1).join('/'))}>{segment}</button>
                   </div>
                 ))}
-                <span className="ml-auto flex items-center gap-1.5 rounded-lg bg-[#f5f4f7] px-2.5 py-1.5 text-[10px] text-muted">
+                <span className="ml-auto flex items-center gap-1.5 text-[10px] text-muted">
                   <GitBranch size={12} /><span className="max-w-20 truncate">{connection.repo.default_branch}</span>
                 </span>
               </div>
 
               <div className="flex flex-col gap-3 px-3 py-3 sm:px-4">
                 <div className="flex gap-2">
-                  <label className="flex min-h-10 min-w-0 flex-1 items-center gap-2 rounded-[10px] border border-line bg-paper px-3 sm:max-w-sm">
+                  <label className="flex min-h-10 min-w-0 flex-1 items-center gap-2 border-b border-line px-2 sm:max-w-sm">
                     <Search size={16} className="shrink-0 text-muted" />
                     <input className="w-full min-w-0 bg-transparent text-xs outline-none" value={filter}
                       placeholder="Search this folder…" aria-label="Filter this folder" onChange={(event) => setFilter(event.target.value)} />
                     {filter && <button aria-label="Clear search" onClick={() => setFilter('')}><X size={15} className="text-muted" /></button>}
                   </label>
-                  <button className="flex size-10 shrink-0 items-center justify-center rounded-[10px] border border-line hover:bg-paper"
-                    title="Refresh" aria-label="Refresh folder" disabled={!!busy} onClick={refresh}><RefreshCw size={16} /></button>
+                  <button className="flex size-10 shrink-0 items-center justify-center border border-line hover:bg-paper"
+                    title="Refresh" aria-label="Refresh folder" disabled={!!busy} onClick={refreshFromGitHub}><RefreshCw size={16} /></button>
                 </div>
                 <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-2">
                   <div className="flex min-w-0 max-w-full items-center gap-0.5 overflow-x-auto">
@@ -492,7 +698,7 @@ export default function App() {
                   <div className="ml-auto flex shrink-0 items-center gap-1">
                     <label className="relative flex items-center">
                       <span className="sr-only">Sort files</span>
-                      <select className="min-h-9 appearance-none rounded-lg bg-white pl-2 pr-6 text-[11px] text-muted outline-none"
+                      <select className="min-h-9 appearance-none rounded-[4px] bg-white pl-2 pr-6 text-[11px] text-muted outline-none"
                         value={sort} onChange={(event) => setSort(event.target.value as FileSort)}>
                         <option value="name">Name</option>
                         <option value="type">Type</option>
@@ -513,24 +719,28 @@ export default function App() {
                 </div>
               </div>
 
-              {loading ? (
+              {loading && items.length > 0 && (
+                <div role="status" className="border-t border-line px-4 py-1.5 text-[11px] text-muted">
+                  Refreshing files…
+                </div>
+              )}
+              {loading && !items.length ? (
                 <div className="py-18 text-center text-xs text-muted">Loading files…</div>
               ) : shown.length === 0 ? (
-                <div className="px-5 py-17 text-center">
-                  <Folder size={30} strokeWidth={1.5} className="mx-auto mb-3 text-[#ad9bcf]" />
-                  <p className="text-sm font-medium">{items.length ? 'Nothing matches' : 'Nothing here yet'}</p>
-                  <p className="mt-1.5 text-xs text-muted">{items.length ? 'Try a different filter.' : 'Upload something or create a folder.'}</p>
-                  {!items.length && path && <button className="action action-outline mt-5" onClick={removeEmptyFolder} disabled={!!busy}>Remove empty folder</button>}
+                <div className="px-5 py-12 text-center">
+                  <p className="text-sm font-medium">{items.length ? 'Nothing matches' : 'Empty folder'}</p>
+                  <p className="mt-1.5 text-xs text-muted">{items.length ? 'Try a different filter.' : 'Upload a file or create a folder.'}</p>
+                  {!items.length && path && path !== PUBLIC_FOLDER && <button className="action action-outline mt-5" onClick={removeEmptyFolder} disabled={!!busy}>Remove empty folder</button>}
                 </div>
               ) : view === 'list' ? (
                 <div>
-                  <div className="hidden grid-cols-[minmax(0,1fr)_minmax(100px,180px)_95px_24px] gap-3 border-b border-line bg-[#fbfafc] px-5 py-3 text-[10px] uppercase tracking-wider text-muted sm:grid">
+                  <div className="hidden grid-cols-[minmax(0,1fr)_minmax(100px,180px)_95px_24px] gap-3 border-b border-line bg-paper px-4 py-2.5 text-[10px] uppercase tracking-wider text-muted sm:grid">
                     <span>Name</span><span>Type</span><span className="text-right">Size</span><span />
                   </div>
                   <div className="divide-y divide-line">
                     {shown.map((item) => (
-                      <button key={item.path} disabled={!!busy} onClick={() => open(item)}
-                        className="grid min-h-17 w-full grid-cols-[minmax(0,1fr)_20px] items-center gap-3 px-3 py-2.5 text-left transition hover:bg-[#faf9fc] sm:grid-cols-[minmax(0,1fr)_minmax(100px,180px)_95px_24px] sm:px-5">
+                      <button key={item.path} disabled={!!busy || loading} onClick={() => open(item)}
+                        className="grid min-h-14 w-full grid-cols-[minmax(0,1fr)_20px] items-center gap-2 px-3 py-2 text-left hover:bg-paper sm:grid-cols-[minmax(0,1fr)_minmax(100px,180px)_95px_24px] sm:px-4">
                         <span className="flex min-w-0 items-center gap-3">
                           <ItemIcon item={item} />
                           <span className="min-w-0">
@@ -544,18 +754,18 @@ export default function App() {
                         <span className="hidden text-right text-xs tabular-nums text-muted sm:block">
                           {item.type === 'file' ? readableSize(item.size) : '—'}
                         </span>
-                        <ChevronRight size={17} className="text-[#b0aab8]" />
+                        <ChevronRight size={17} className="text-muted" />
                       </button>
                     ))}
                   </div>
                 </div>
               ) : (
-                <div className="grid grid-cols-2 gap-3 border-t border-line p-3 sm:grid-cols-3 sm:p-5 lg:grid-cols-4">
+                <div className="grid grid-cols-2 gap-2 border-t border-line p-3 sm:grid-cols-3 sm:p-4 lg:grid-cols-4">
                   {shown.map((item) => (
-                    <button key={item.path} disabled={!!busy} onClick={() => open(item)}
-                      className="flex min-h-38 min-w-0 flex-col items-start rounded-xl border border-line p-3.5 text-left hover:bg-[#faf9fc]">
+                    <button key={item.path} disabled={!!busy || loading} onClick={() => open(item)}
+                      className="flex min-h-32 min-w-0 flex-col items-start border border-line p-3 text-left hover:bg-paper">
                       <ItemIcon item={item} large />
-                      <span className="mt-4 w-full truncate text-xs font-medium">{item.name}</span>
+                      <span className="mt-3 w-full truncate text-xs font-medium">{item.name}</span>
                       <span className="mt-1.5 w-full truncate text-[10px] text-muted">
                         {typeLabel(item)}{item.type === 'file' ? ' · ' + readableSize(item.size) : ''}
                       </span>
@@ -563,34 +773,36 @@ export default function App() {
                   ))}
                 </div>
               )}
-              {items.length >= 1000 && <p className="border-t border-line px-4 py-3 text-xs text-muted">
-                GitHub only returns the first 1,000 entries per folder.
-              </p>}
+              {items.length >= 1000 && (path === PUBLIC_FOLDER || path.startsWith(PUBLIC_FOLDER + '/')) && (
+                <p className="border-t border-line px-4 py-3 text-xs text-muted">
+                  GitHub only returns the first 1,000 entries per folder.
+                </p>
+              )}
             </div>
 
             <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted">
               {path ? <button className="flex min-h-10 items-center gap-1.5 hover:text-ink"
                 onClick={() => navigate(segments.slice(0, -1).join('/'))}><ArrowLeft size={14} /> Parent folder</button> :
                 <span>{shown.length} items shown</span>}
-              <span>Max upload 10 MiB · Git-backed storage</span>
+              <span>{path === PUBLIC_FOLDER || path.startsWith(PUBLIC_FOLDER + '/')
+                ? 'Public · 10 MiB max'
+                : connection.api.maxUploadBytes > MAX_UPLOAD_BYTES
+                  ? 'Encrypted · R2 storage'
+                  : 'Encrypted · 10 MiB max'}</span>
             </div>
           </section>
         )}
 
-        {error && <div role="alert" className="mt-5 flex items-start justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-900">
-          <span className="break-words">{error}</span>
-          <button className="shrink-0" aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button>
-        </div>}
       </main>
 
       {selected && connection && (
-        <div className="fixed inset-0 z-40 flex justify-end bg-[#201b2b]/30" role="presentation"
+        <div className="fixed inset-0 z-40 flex justify-end bg-black/30" role="presentation"
           onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
-          <section className="flex h-dvh w-full max-w-lg flex-col bg-white shadow-2xl" role="dialog" aria-modal="true"
+          <section className="flex h-dvh w-full max-w-lg flex-col border-l border-line bg-white" role="dialog" aria-modal="true"
             aria-label={'File details: ' + selected.name}>
             <header className="flex min-h-16 items-center gap-3 border-b border-line px-4 sm:px-6">
               <span className="min-w-0 flex-1 truncate text-sm font-medium">File details</span>
-              <button className="flex size-10 items-center justify-center rounded-lg hover:bg-paper" aria-label="Close details"
+              <button className="flex size-10 items-center justify-center rounded-[4px] hover:bg-paper" aria-label="Close details"
                 onClick={() => setSelected(null)}><X size={19} /></button>
             </header>
             <div className="min-h-0 flex-1 overflow-auto p-5 sm:p-6">
@@ -602,10 +814,10 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="min-h-24 overflow-auto rounded-xl border border-line bg-paper p-3">
+              <div className="min-h-24 overflow-auto border border-line bg-paper p-3">
                 {preview.kind === 'loading' && <p className="py-10 text-center text-xs text-muted">Loading preview…</p>}
                 {preview.kind === 'image' && <img src={preview.value} alt={selected.name}
-                  className="mx-auto max-h-[42dvh] max-w-full rounded-lg object-contain" />}
+                  className="mx-auto max-h-[42dvh] max-w-full rounded-[4px] object-contain" />}
                 {preview.kind === 'text' && <pre className="max-h-[42dvh] overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-5">{preview.value}</pre>}
                 {preview.kind === 'other' && <p className="py-10 text-center text-xs text-muted">No preview available. Download to open.</p>}
                 {preview.kind === 'error' && <p className="py-10 text-center text-xs text-red-700">Preview failed: {preview.value}</p>}
@@ -625,16 +837,27 @@ export default function App() {
                   <dt className="text-muted">Size</dt><dd>{readableSize(selected.size)} ({selected.size.toLocaleString()} bytes)</dd>
                 </div>
                 <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-3 py-3">
-                  <dt className="text-muted">Version</dt><dd className="break-all font-mono text-[11px]">{selected.sha.slice(0, 12)}</dd>
+                  <dt className="text-muted">{selected.path.startsWith(PUBLIC_FOLDER + '/') ? 'Git SHA' : 'File ID'}</dt>
+                  <dd className="break-all font-mono text-[11px]">{selected.sha.slice(0, 12)}</dd>
                 </div>
                 <div className="grid grid-cols-[88px_minmax(0,1fr)] gap-3 py-3">
                   <dt className="text-muted">Repository</dt><dd className="break-all">{connection.repo.full_name}</dd>
                 </div>
               </dl>
+              {selected.size > 64 * 1024 * 1024 &&
+                !selected.path.startsWith(PUBLIC_FOLDER + '/') &&
+                typeof (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker !== 'function' && (
+                <p className="mt-4 text-xs leading-5 text-muted">
+                  This browser cannot save files over 64 MiB. Use a desktop Chromium browser for streamed downloads.
+                </p>
+              )}
               <a href={'https://github.com/' + connection.repo.full_name + '/commits/' +
-                encodeURIComponent(connection.repo.default_branch) + '/' + encodePath(selected.path)}
+                encodeURIComponent(connection.repo.default_branch) + '/' +
+                encodePath(selected.path.startsWith(PUBLIC_FOLDER + '/')
+                  ? 'public-files' + selected.path.slice(PUBLIC_FOLDER.length)
+                  : '.vault/state.json')}
                 target="_blank" rel="noopener noreferrer" className="mt-4 inline-flex items-center gap-1.5 text-xs text-accent hover:underline">
-                <GitBranch size={14} /> File history <ExternalLink size={12} />
+                <GitBranch size={14} /> {selected.path.startsWith(PUBLIC_FOLDER + '/') ? 'Public file history' : 'Encrypted vault history'} <ExternalLink size={12} />
               </a>
             </div>
             {error && <p role="alert" className="border-t border-red-200 bg-red-50 px-5 py-3 text-xs text-red-900">{error}</p>}
@@ -644,7 +867,11 @@ export default function App() {
               <button className="action action-outline !px-2" disabled={!!busy} onClick={() => remove(selected)}>
                 <Trash2 size={15} /> Delete
               </button>
-              <button className="action action-primary !px-2" disabled={!!busy} onClick={() => download(selected)}>
+              <button className="action action-primary !px-2"
+                disabled={!!busy || (selected.size > 64 * 1024 * 1024 &&
+                  !selected.path.startsWith(PUBLIC_FOLDER + '/') &&
+                  typeof (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker !== 'function')}
+                onClick={() => download(selected)}>
                 <ArrowDownToLine size={15} /> Download
               </button>
             </div>
@@ -657,7 +884,7 @@ export default function App() {
           title={nameDialog.type === 'folder' ? 'New folder' : 'Rename file'}
           value={nameDialog.item?.name || ''} onCancel={() => setNameDialog(null)} onSave={saveName} />
       )}
-      <footer className="pb-7 text-center text-[11px] text-muted">Small files. Real history. Built on GitHub.</footer>
+
     </div>
   );
 }

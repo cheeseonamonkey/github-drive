@@ -1,0 +1,13 @@
+{
+  "name": "repodrive-storage",
+  "main": "index.ts",
+  "compatibility_date": "2026-11-01",
+  "vars": {
+    "SITE_URL": "https://YOURNAME.github.io/YOUR-REPO/",
+    "GITHUB_OWNER": "YOURNAME",
+    "GITHUB_REPO": "YOUR-REPO"
+  },
+  "r2_buckets": [
+    { "binding": "BLOCKS", "bucket_name": "repodrive-blocks" }
+  ]
+}
